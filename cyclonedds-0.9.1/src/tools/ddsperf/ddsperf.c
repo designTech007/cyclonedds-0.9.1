@@ -616,6 +616,7 @@ static void *init_sample (union data *data, uint32_t seq)
   return baggage;
 }
 
+#define CHECKPOINT
 static uint32_t pubthread (void *varg)
 {
   int result;
@@ -666,7 +667,8 @@ static uint32_t pubthread (void *varg)
   {
     /* lsb of timestamp is abused to signal whether the sample is a ping requiring a response or not */
     bool reqresp = (ping_frac == 0) ? 0 : (ping_frac == UINT32_MAX) ? 1 : (ddsrt_random () <= ping_frac);
-    if ((result = dds_write_ts (wr_data, &data, (t_write & ~1) | reqresp)) != DDS_RETCODE_OK)
+    CHECKPOINT
+	if ((result = dds_write_ts (wr_data, &data, (t_write & ~1) | reqresp)) != DDS_RETCODE_OK)
     {
       printf ("write error: %d\n", result);
       fflush (stdout);
@@ -679,6 +681,7 @@ static uint32_t pubthread (void *varg)
       time_counter = time_interval = 1;
       continue;
     }
+	CHECKPOINT
     if (reqresp)
     {
       dds_write_flush (wr_data);

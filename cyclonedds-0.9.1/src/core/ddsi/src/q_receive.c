@@ -3294,7 +3294,9 @@ static bool do_packet (struct thread_state1 * const ts1, struct ddsi_domaingv *g
   if (sz > 0 && !gv->deaf)
   {
     nn_rmsg_setsize (rmsg, (uint32_t) sz);
+	CHECKPOINT
     handle_rtps_message(ts1, gv, conn, guidprefix, rbpool, rmsg, (size_t) sz, buff, &srcloc);
+	CHECKPOINT
   }
   nn_rmsg_commit (rmsg);
   return (sz > 0);
@@ -3485,7 +3487,7 @@ void trigger_recv_threads (const struct ddsi_domaingv *gv)
     }
   }
 }
-
+#define CHECKPOINT
 uint32_t recv_thread (void *vrecv_thread_arg)
 {
   struct thread_state1 * const ts1 = lookup_thread_state ();
