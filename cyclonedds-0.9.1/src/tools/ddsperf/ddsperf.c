@@ -218,6 +218,7 @@ struct eseq_stat {
   uint64_t nlost;
   uint64_t nrecv_bytes;
   uint32_t last_size;
+  uint32_t lost_flag; 	/*dt. last second, loss package flag*/
 
   /* stats printer state */
   struct {
@@ -616,7 +617,6 @@ static void *init_sample (union data *data, uint32_t seq)
   return baggage;
 }
 
-#define CHECKPOINT
 static uint32_t pubthread (void *varg)
 {
   int result;
@@ -628,7 +628,7 @@ static uint32_t pubthread (void *varg)
   (void) varg;
 
   memset (&data, 0, sizeof (data));
-  assert (nkeyvals > 0);
+  assert (nkeyvals > 0);  /*dt. default 1*/
   assert (topicsel != OU || nkeyvals == 1);
 
   baggage = init_sample (&data, 0);
@@ -667,8 +667,7 @@ static uint32_t pubthread (void *varg)
   {
     /* lsb of timestamp is abused to signal whether the sample is a ping requiring a response or not */
     bool reqresp = (ping_frac == 0) ? 0 : (ping_frac == UINT32_MAX) ? 1 : (ddsrt_random () <= ping_frac);
-    CHECKPOINT
-	if ((result = dds_write_ts (wr_data, &data, (t_write & ~1) | reqresp)) != DDS_RETCODE_OK)
+    if ((result = dds_write_ts (wr_data, &data, (t_write & ~1) | reqresp)) != DDS_RETCODE_OK)
     {
       printf ("write error: %d\n", result);
       fflush (stdout);
@@ -681,8 +680,7 @@ static uint32_t pubthread (void *varg)
       time_counter = time_interval = 1;
       continue;
     }
-	CHECKPOINT
-    if (reqresp)
+    if (reqresp) /*dt. 0*/
     {
       dds_write_flush (wr_data);
     }
@@ -716,15 +714,15 @@ static uint32_t pubthread (void *varg)
 
     t_write = t_post_write;
     if (pub_rate < HUGE_VAL)
-    {
-      if (++batch_counter == burstsize)
+    { 
+      if (++batch_counter == burstsize) /*dt. default 1*/
       {
         /* FIXME: should average rate over a short-ish period, rather than over the entire run */
-        while (((double) (ntot / burstsize) / ((double) (t_write - tfirst) / 1e9 + 5e-3)) > pub_rate && !ddsrt_atomic_ld32 (&termflag))
+        while (((double) (ntot / burstsize) / ((double) (t_write - tfirst) / 1e9 + 5e-3)) > pub_rate && !ddsrt_atomic_ld32 (&termflag)) /*dt. pub_rate 发送频率，10Hz就是10*/
         {
           /* FIXME: flushing manually because batching is not yet implemented properly */
-          dds_write_flush (wr_data);
-          dds_sleepfor (DDS_MSECS (1));
+          dds_write_flush (wr_data);			/*dt. overhead maybe 1ms*/
+          dds_sleepfor (DDS_MSECS (1));  
           t_write = dds_time ();
           time_counter = time_interval = 1;
         }
@@ -785,7 +783,33 @@ static int cmp_int64 (const void *va, const void *vb)
   return (*a == *b) ? 0 : (*a < *b) ? -1 : 1;
 }
 
-static int64_t *latencystat_print (struct latencystat *y, const char *prefix, const char *subprefix, dds_instance_handle_t pubhandle, dds_instance_handle_t pphandle, uint32_t size)
+typedef enum
+{
+    JITTER_LOST_PACKAGE,
+    JITTER_COUNT_INVALID,
+    JITTER_OK
+}jitter_status;
+    
+typedef struct
+{
+    jitter_status flag;      
+    double average;
+    double min;
+    double max;
+    double _50_percentage;
+    double _90_percentage;
+    double _99_percentage;
+    uint32_t cnt;
+}jitter_stat;       /*1秒内抖动统计*/
+
+/*每秒抖动统计，大数组放外面*/
+int64_t jitter[PINGPONG_RAWSIZE] = {0};
+
+/*一天时间抖动统计*/
+jitter_stat jitter_main[86400] = {0};   
+uint32_t jitter_index = 0;
+
+static int64_t *latencystat_print (struct latencystat *y, const char *prefix, const char *subprefix, dds_instance_handle_t pubhandle, dds_instance_handle_t pphandle, uint32_t size, uint32_t lost_flag)
 {
   if (y->cnt > 0)
   {
@@ -799,8 +823,61 @@ static int64_t *latencystat_print (struct latencystat *y, const char *prefix, co
       snprintf (ppinfo, sizeof (ppinfo), "%s:%"PRIu32, pp->hostname, pp->pid);
     ddsrt_mutex_unlock (&disc_lock);
 
+	if (0 == strcmp(subprefix, "sublat"))
+	{
+		int64_t jitter_sum = 0;
+		uint32_t jitter_cnt = rawcnt - 1;
+
+		if (!lost_flag) /*dt. 一旦丢包，不再计算抖动*/
+		{
+			if (jitter_cnt > 0)
+			{
+				for (uint32_t i = 0; i < jitter_cnt; i++)
+				{
+					jitter[i] = llabs(y->raw[i + 1] - y->raw[i]);
+                    jitter_sum += jitter[i];
+				}
+
+                /*只对jitter_cnt个元素做排序，所以不用初始化数组*/
+				qsort(jitter, jitter_cnt, sizeof(*jitter), cmp_int64);
+                
+                jitter_main[jitter_index].flag = JITTER_OK;
+                jitter_main[jitter_index].average = (double) jitter_sum / (double) jitter_cnt / 1e3;
+                jitter_main[jitter_index]._50_percentage = (double) jitter[jitter_cnt - (jitter_cnt + 1) / 2] / 1e3;
+                jitter_main[jitter_index]._90_percentage = (double) jitter[jitter_cnt - (jitter_cnt + 9) / 10] / 1e3;
+                jitter_main[jitter_index]._99_percentage = (double) jitter[jitter_cnt - (jitter_cnt + 99) / 100] / 1e3;
+                jitter_main[jitter_index].min = (double) jitter[0] / 1e3;
+                jitter_main[jitter_index].max = (double) jitter[jitter_cnt - 1] / 1e3;
+                jitter_main[jitter_index].cnt = jitter_cnt;
+                
+				printf("[jitter] %s%s %s mean %.3fus min %.3fus 50%% %.3fus 90%% %.3fus 99%% %.3fus max %.3fus cnt %"PRIu32"\n", 
+							prefix /*pid time*/, subprefix /*sublat*/, ppinfo,
+							jitter_main[jitter_index].average,
+				            jitter_main[jitter_index].min,
+				            jitter_main[jitter_index]._50_percentage,
+				            jitter_main[jitter_index]._90_percentage,
+				            jitter_main[jitter_index]._99_percentage,
+				            jitter_main[jitter_index].max,
+				            jitter_main[jitter_index].cnt);
+			}
+			else
+			{
+			    jitter_main[jitter_index].flag = JITTER_COUNT_INVALID;
+				printf("[jitter] jitter cnt[%d] invalid\n", jitter_cnt);
+			}
+		}
+		else
+		{
+		    jitter_main[jitter_index].flag = JITTER_LOST_PACKAGE;
+			printf("[jitter] jitter lost package\n");
+		}
+
+        ++jitter_index;
+	}
+
+#if 0
     qsort (y->raw, rawcnt, sizeof (*y->raw), cmp_int64);
-    printf ("%s%s %s size %"PRIu32" mean %.3fus min %.3fus 50%% %.3fus 90%% %.3fus 99%% %.3fus max %.3fus cnt %"PRIu32"\n",
+    printf ("[latency] %s%s %s size %"PRIu32" mean %.3fus min %.3fus 50%% %.3fus 90%% %.3fus 99%% %.3fus max %.3fus cnt %"PRIu32"\n",
             prefix, subprefix, ppinfo, size,
             (double) y->sum / (double) y->cnt / 1e3,
             (double) y->min / 1e3,
@@ -809,6 +886,7 @@ static int64_t *latencystat_print (struct latencystat *y, const char *prefix, co
             (double) y->raw[rawcnt - (rawcnt + 99) / 100] / 1e3,
             (double) y->max / 1e3,
             y->cnt);
+#endif
   }
   return y->raw;
 }
@@ -821,7 +899,7 @@ static void latencystat_update (struct latencystat *x, int64_t tdelta)
   if (x->cnt < PINGPONG_RAWSIZE)
     x->raw[x->cnt] = tdelta;
   x->cnt++;
-  x->totcnt++;
+  x->totcnt++;  /*dt. 没看到具体作用*/
 }
 
 static void init_eseq_admin (struct eseq_admin *ea, unsigned nkeys)
@@ -1018,6 +1096,7 @@ static dds_entity_t get_pong_writer (dds_instance_handle_t pubhandle)
   return wr_pong;
 }
 
+#if 0
 static bool process_data (dds_entity_t rd, struct subthread_arg *arg)
 {
   uint32_t max_samples = arg->max_samples;
@@ -1066,6 +1145,60 @@ static bool process_data (dds_entity_t rd, struct subthread_arg *arg)
   }
   return (nread_data > 0);
 }
+#else
+static bool process_data (dds_entity_t rd, struct subthread_arg *arg)
+{
+  uint32_t max_samples = arg->max_samples;
+  dds_sample_info_t *iseq = arg->iseq;
+  void **mseq = arg->mseq;
+  int32_t nread_data;
+  
+  if ((nread_data = dds_take (rd, mseq, iseq, max_samples, max_samples)) < 0)
+    error2 ("dds_take (rd_data): %d\n", (int) nread_data);
+ 			
+  dds_time_t t_read = dds_time();
+  
+  for (int32_t i = 0; i < nread_data; i++)
+  {
+    if (iseq[i].valid_data)
+    {
+      // time stamp is only used when tracking latency, and reading the clock a couple of
+      // times every microsecond is rather costly 
+	  const int64_t tdelta = sublatency ? t_read- iseq[i].source_timestamp : 0; 
+      uint32_t seq = 0, keyval = 0, size = 0;
+      switch (topicsel)
+      {
+        case KS: {
+          KeyedSeq *d = mseq[i]; keyval = d->keyval; seq = d->seq; size = topic_payload_size (topicsel, d->baggage._length);
+          break;
+        }
+        case K32:    { Keyed32 *d     = mseq[i]; keyval = d->keyval; seq = d->seq; size = topic_payload_size (topicsel, 0); } break;
+        case K256:   { Keyed256 *d    = mseq[i]; keyval = d->keyval; seq = d->seq; size = topic_payload_size (topicsel, 0); } break;
+        case OU:     { OneULong *d    = mseq[i]; keyval = 0;         seq = d->seq; size = topic_payload_size (topicsel, 0); } break;
+        case UK16:   { Unkeyed16 *d   = mseq[i]; keyval = 0;         seq = d->seq; size = topic_payload_size (topicsel, 0); } break;
+        case UK1024: { Unkeyed1024 *d = mseq[i]; keyval = 0;         seq = d->seq; size = topic_payload_size (topicsel, 0); } break;
+        case S16:    { Struct16 *d    = mseq[i]; keyval = d->keyval; seq = d->seq; size = topic_payload_size (topicsel, 0); } break;
+        case S256:   { Struct256 *d   = mseq[i]; keyval = d->keyval; seq = d->seq; size = topic_payload_size (topicsel, 0); } break;
+        case S4k:    { Struct4k *d    = mseq[i]; keyval = d->keyval; seq = d->seq; size = topic_payload_size (topicsel, 0); } break;
+        case S32k:   { Struct32k *d   = mseq[i]; keyval = d->keyval; seq = d->seq; size = topic_payload_size (topicsel, 0); } break;
+      }
+      (void) check_eseq (&eseq_admin, seq, keyval, size, iseq[i].publication_handle, tdelta);
+      if (iseq[i].source_timestamp & 1)
+      {
+        dds_entity_t wr_pong;
+        if ((wr_pong = get_pong_writer (iseq[i].publication_handle)) != 0)
+        {
+          dds_return_t rc;
+          if ((rc = dds_write_ts (wr_pong, mseq[i], iseq[i].source_timestamp - 1)) < 0 && rc != DDS_RETCODE_TIMEOUT)
+            error2 ("dds_write_ts (wr_pong, mseq[i], iseq[i].source_timestamp): %d\n", (int) rc);
+          dds_write_flush (wr_pong);
+        }
+      }
+    }
+  }
+  return (nread_data > 0);
+}
+#endif
 
 static bool process_ping (dds_entity_t rd, struct subthread_arg *arg)
 {
@@ -1605,6 +1738,14 @@ static bool print_stats (dds_time_t tref, dds_time_t tnow, dds_time_t tprev, str
       tot_nlost += x->nlost;
       nrecv += x->nrecv - x->ref[refidx1s].nrecv;
       nlost += x->nlost - x->ref[refidx1s].nlost;
+	  if (x->nlost - x->ref[refidx1s].nlost > 0)
+      {
+		x->lost_flag = 1;
+	  }
+	  else
+	  {
+		x->lost_flag = 0;
+	  }
       nrecv_bytes += x->nrecv_bytes - x->ref[refidx1s].nrecv_bytes;
       nrecv10s += x->nrecv - x->ref[refidx10s].nrecv;
       nrecv10s_bytes += x->nrecv_bytes - x->ref[refidx10s].nrecv_bytes;
@@ -1617,7 +1758,7 @@ static bool print_stats (dds_time_t tref, dds_time_t tnow, dds_time_t tprev, str
     }
     ddsrt_mutex_unlock (&ea->lock);
 
-    if (nrecv > 0 || substat_every_second)
+    if (nrecv > 0 || substat_every_second)  /*dt. substat_every_second: ddsperf sub -1*/
     {
       const double dt = (double) (tnow - tprev);
       printf ("%s size %"PRIu32" total %"PRIu64" lost %"PRIu64" delta %"PRIu64" lost %"PRIu64" rate %.2f kS/s %.2f Mb/s (%.2f kS/s %.2f Mb/s)\n",
@@ -1640,7 +1781,7 @@ static bool print_stats (dds_time_t tref, dds_time_t tnow, dds_time_t tprev, str
         ddsrt_mutex_unlock (&ea->lock);
         if (y.cnt > 0)
           output = true;
-        newraw = latencystat_print (&y, prefix, " sublat", ea->ph[i], ea->pph[i], x->last_size);
+        newraw = latencystat_print (&y, prefix, "sublat", ea->ph[i], ea->pph[i], x->last_size, x->lost_flag);
         ddsrt_mutex_lock (&ea->lock);
       }
       ddsrt_mutex_unlock (&ea->lock);
@@ -1658,7 +1799,7 @@ static bool print_stats (dds_time_t tref, dds_time_t tnow, dds_time_t tprev, str
     ddsrt_mutex_unlock (&pongstat_lock);
     if (y.info.cnt > 0)
       output = true;
-    newraw = latencystat_print (&y.info, prefix, "", y.pubhandle, y.pphandle, topic_payload_size (topicsel, baggagesize));
+    newraw = latencystat_print (&y.info, prefix, "", y.pubhandle, y.pphandle, topic_payload_size (topicsel, baggagesize), 0);
     ddsrt_mutex_lock (&pongstat_lock);
   }
   ddsrt_mutex_unlock (&pongstat_lock);
@@ -2113,6 +2254,47 @@ static void set_mode (int xoptind, int xargc, char * const xargv[])
   }
 }
 
+void jitter_print(int signo)
+{
+    printf("%-10s %-12s %-12s %-12s %-12s %-12s %-12s %-12s\n"
+            , "second", "mean(us)", "min(us)", "50%(us)", "90%(us)", "99%(us)", "max(us)", "cnt");
+    
+    for (uint32_t i = 0; i < jitter_index; i++)
+    {
+        switch (jitter_main[i].flag)
+        {
+           case JITTER_OK:
+                printf("%-10d %-12.3f %-12.3f %-12.3f %-12.3f %-12.3f %-12.3f %-"PRIu32"\n",
+                            i+1,
+							jitter_main[i].average,
+				            jitter_main[i].min,
+				            jitter_main[i]._50_percentage,
+				            jitter_main[i]._90_percentage,
+				            jitter_main[i]._99_percentage,
+				            jitter_main[i].max,
+				            jitter_main[i].cnt);
+                break;
+
+           case JITTER_LOST_PACKAGE:
+                printf("%-10d jitter lost package\n", i+1);
+                break;
+
+           case JITTER_COUNT_INVALID:
+                printf("%-10d jitter count invalid\n", i+1);
+                break;
+
+           default:
+                printf("%-10d jitter flag[%d] invalid\n", i+1, jitter_main[i].flag);
+                break;
+        }
+    }
+
+    if (signo)
+    {
+        exit(0);
+    }
+}
+
 int main (int argc, char *argv[])
 {
   dds_entity_t ws;
@@ -2530,18 +2712,20 @@ int main (int argc, char *argv[])
 #ifdef __APPLE__
   DDSRT_WARNING_GNUC_OFF(sign-conversion)
 #endif
-  sigaddset (&sigset, SIGHUP);
-  sigaddset (&sigset, SIGINT);
-  sigaddset (&sigset, SIGTERM);
+  sigaddset (&sigset, SIGHUP);          /*dt. terminal exit*/
+  //sigaddset (&sigset, SIGINT);        /*dt. ctrl + c*/    
+  sigaddset (&sigset, SIGTERM);         /*dt. kill*/
 #ifdef __APPLE__
   DDSRT_WARNING_GNUC_ON(sign-conversion)
 #endif
-  sigprocmask (SIG_BLOCK, &sigset, &osigset);
-  ddsrt_thread_create (&sigtid, "sigthread", &attr, sigthread, &sigset);
+  sigprocmask (SIG_BLOCK, &sigset, &osigset);       /*dt. 阻塞信号*/
+  ddsrt_thread_create (&sigtid, "sigthread", &attr, sigthread, &sigset);  /*dt. sigthread等待sigset信号集，*/
 #if defined __APPLE__ || defined __linux
   signal (SIGXFSZ, sigxfsz_handler);
 #endif
 #endif
+
+  signal (SIGINT, jitter_print);                  /*dt. 添加信号处理函数*/  
 
   /* Run until time limit reached or a signal received.  (The time calculations
      ignore the possibility of overflow around the year 2260.) */
@@ -2642,6 +2826,8 @@ int main (int argc, char *argv[])
       maybe_send_new_ping (tnow, &tnextping);
     }
   }
+
+  jitter_print(-1);
 
   dds_delete_statistics (stats.pubstat);
   dds_delete_statistics (stats.substat);

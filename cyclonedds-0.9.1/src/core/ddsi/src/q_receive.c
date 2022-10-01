@@ -3294,9 +3294,7 @@ static bool do_packet (struct thread_state1 * const ts1, struct ddsi_domaingv *g
   if (sz > 0 && !gv->deaf)
   {
     nn_rmsg_setsize (rmsg, (uint32_t) sz);
-	CHECKPOINT
     handle_rtps_message(ts1, gv, conn, guidprefix, rbpool, rmsg, (size_t) sz, buff, &srcloc);
-	CHECKPOINT
   }
   nn_rmsg_commit (rmsg);
   return (sz > 0);
@@ -3487,7 +3485,7 @@ void trigger_recv_threads (const struct ddsi_domaingv *gv)
     }
   }
 }
-#define CHECKPOINT
+
 uint32_t recv_thread (void *vrecv_thread_arg)
 {
   struct thread_state1 * const ts1 = lookup_thread_state ();
@@ -3498,7 +3496,7 @@ uint32_t recv_thread (void *vrecv_thread_arg)
   ddsrt_mtime_t next_thread_cputime = { 0 };
 
   nn_rbufpool_setowner (rbpool, ddsrt_thread_self ());
-  if (waitset == NULL)
+  if (waitset == NULL) /*dt. ddsperf*/
   {
     struct ddsi_tran_conn *conn = recv_thread_arg->u.single.conn;
     while (ddsrt_atomic_ld32 (&gv->rtps_keepgoing))
@@ -3570,7 +3568,7 @@ uint32_t recv_thread (void *vrecv_thread_arg)
         }
       }
 
-      if ((ctx = os_sockWaitsetWait (waitset)) != NULL)
+      if ((ctx = os_sockWaitsetWait (waitset)) != NULL)   /*dt. select*/
       {
         int idx;
         ddsi_tran_conn_t conn;
