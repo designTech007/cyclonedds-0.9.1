@@ -50,6 +50,8 @@
 
 #define PINGPONG_RAWSIZE 20000
 
+#define DEBUG
+
 enum topicsel {
   KS,    /* KeyedSeq type: seq#, key, sequence-of-octet */
   K32,   /* Keyed32  type: seq#, key, array-of-24-octet (sizeof = 32) */
@@ -617,6 +619,14 @@ static void *init_sample (union data *data, uint32_t seq)
   return baggage;
 }
 
+
+static inline uint64_t get_arch_cycle(void)
+{
+	uint64_t cycle;
+    asm volatile("mrs %0, cntvct_el0" : "=r" (cycle));
+    return cycle;
+}
+
 static uint32_t pubthread (void *varg)
 {
   int result;
@@ -665,6 +675,9 @@ static uint32_t pubthread (void *varg)
   dds_time_t t_write = tfirst;
   while (!ddsrt_atomic_ld32 (&termflag))
   {
+#ifdef DEBUG
+    t_write = get_arch_cycle();                             
+#endif
     /* lsb of timestamp is abused to signal whether the sample is a ping requiring a response or not */
     bool reqresp = (ping_frac == 0) ? 0 : (ping_frac == UINT32_MAX) ? 1 : (ddsrt_random () <= ping_frac);
     if ((result = dds_write_ts (wr_data, &data, (t_write & ~1) | reqresp)) != DDS_RETCODE_OK)
@@ -1155,9 +1168,13 @@ static bool process_data (dds_entity_t rd, struct subthread_arg *arg)
   
   if ((nread_data = dds_take (rd, mseq, iseq, max_samples, max_samples)) < 0)
     error2 ("dds_take (rd_data): %d\n", (int) nread_data);
- 			
+
+#ifdef DEBUG
+   dds_time_t t_read = get_arch_cycle();
+#else
   dds_time_t t_read = dds_time();
-  
+#endif
+
   for (int32_t i = 0; i < nread_data; i++)
   {
     if (iseq[i].valid_data)
@@ -1761,10 +1778,12 @@ static bool print_stats (dds_time_t tref, dds_time_t tnow, dds_time_t tprev, str
     if (nrecv > 0 || substat_every_second)  /*dt. substat_every_second: ddsperf sub -1*/
     {
       const double dt = (double) (tnow - tprev);
+ #ifndef DEBUG 
       printf ("%s size %"PRIu32" total %"PRIu64" lost %"PRIu64" delta %"PRIu64" lost %"PRIu64" rate %.2f kS/s %.2f Mb/s (%.2f kS/s %.2f Mb/s)\n",
               prefix, last_size, tot_nrecv, tot_nlost, nrecv, nlost,
               (double) nrecv * 1e6 / dt, (double) nrecv_bytes * 8 * 1e3 / dt,
               (double) nrecv10s * 1e6 / (10 * dt), (double) nrecv10s_bytes * 8 * 1e3 / (10 * dt));
+ #endif
       output = true;
     }
 
@@ -1805,6 +1824,7 @@ static bool print_stats (dds_time_t tref, dds_time_t tnow, dds_time_t tprev, str
   ddsrt_mutex_unlock (&pongstat_lock);
   free (newraw);
 
+#ifndef DEBUG 
   if (record_cputime (cputime_state, prefix, tnow))
     output = true;
 
@@ -1837,6 +1857,7 @@ static bool print_stats (dds_time_t tref, dds_time_t tnow, dds_time_t tprev, str
     }
 #undef MAXS
   }
+#endif
 
   if (output)
     record_netload (netload_state, prefix, tnow);
